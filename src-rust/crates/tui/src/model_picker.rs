@@ -365,14 +365,40 @@ pub fn models_for_provider(provider_id: &str) -> Vec<ModelEntry> {
         "venice" => vec![
             model_entry("llama-3.3-70b", "Llama 3.3 70B", "128K context"),
         ],
-        "ollama" => vec![
-            model_entry("llama3.2", "Llama 3.2", "local"),
-            model_entry("mistral", "Mistral", "local"),
-            model_entry("codellama", "Code Llama", "local"),
-            model_entry("gemma2", "Gemma 2", "local"),
-            model_entry("phi3", "Phi-3", "local"),
-            model_entry("qwen2.5", "Qwen 2.5", "local"),
-        ],
+        "ollama" => {
+            // Query Ollama for locally installed models via curl
+            let mut models = Vec::new();
+            let host = std::env::var("OLLAMA_HOST")
+                .unwrap_or_else(|_| "http://localhost:11434".to_string());
+            if let Ok(output) = std::process::Command::new("curl")
+                .args(["-s", "--connect-timeout", "2", &format!("{}/api/tags", host)])
+                .output()
+            {
+                if let Ok(body) = String::from_utf8(output.stdout) {
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
+                        if let Some(model_list) = json.get("models").and_then(|m| m.as_array()) {
+                            for m in model_list {
+                                if let Some(name) = m.get("name").and_then(|n| n.as_str()) {
+                                    // Skip embedding models
+                                    if name.contains("embed") { continue; }
+                                    let size = m.get("size")
+                                        .and_then(|s| s.as_u64())
+                                        .map(|s| format!("{:.1}GB", s as f64 / 1_073_741_824.0))
+                                        .unwrap_or_else(|| "local".to_string());
+                                    let display = name.strip_suffix(":latest").unwrap_or(name);
+                                    models.push(model_entry(name, display, &size));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if models.is_empty() {
+                vec![model_entry("gemma4:e4b", "Gemma 4 E4B", "local")]
+            } else {
+                models
+            }
+        },
         "azure" => vec![
             model_entry("gpt-4o", "GPT-4o (Azure)", "128K context"),
             model_entry("gpt-4o-mini", "GPT-4o mini (Azure)", "128K context"),
@@ -415,7 +441,7 @@ pub fn default_model_for_provider(provider_id: &str) -> String {
         "togetherai" | "together-ai" => "togetherai/meta-llama/Llama-3.3-70B-Instruct-Turbo".to_string(),
         "deepinfra" => "deepinfra/meta-llama/Llama-3.3-70B-Instruct".to_string(),
         "venice" => "venice/llama-3.3-70b".to_string(),
-        "ollama" => "ollama/llama3.2".to_string(),
+        "ollama" => "ollama/gemma4:e4b".to_string(),
         "lmstudio" => "lmstudio/default".to_string(),
         "llamacpp" => "llamacpp/default".to_string(),
         "azure" => "azure/gpt-4o".to_string(),

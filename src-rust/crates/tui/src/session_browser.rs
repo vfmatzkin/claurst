@@ -33,8 +33,8 @@ pub struct SessionEntry {
     /// Human-readable relative time, e.g. "2 hours ago".
     pub last_updated: String,
     pub message_count: usize,
-    /// Estimated USD cost for the session.
-    pub cost_usd: f64,
+    /// Working directory where the session was started.
+    pub working_dir: String,
 }
 
 /// State for the session browser overlay.
@@ -45,6 +45,14 @@ pub struct SessionBrowserState {
     pub mode: SessionBrowserMode,
     /// Input buffer used while in `Rename` mode.
     pub rename_input: String,
+    /// Collapsed directory groups (working_dir paths that are hidden).
+    pub collapsed_dirs: std::collections::HashSet<String>,
+}
+
+/// A flattened row in the browser — either a directory header or a session.
+pub enum BrowserRow {
+    DirHeader { path: String, count: usize, collapsed: bool },
+    Session { index: usize },
 }
 
 // ---------------------------------------------------------------------------
@@ -60,16 +68,69 @@ impl SessionBrowserState {
             sessions: Vec::new(),
             mode: SessionBrowserMode::Browse,
             rename_input: String::new(),
+            collapsed_dirs: std::collections::HashSet::new(),
         }
     }
 
     /// Open the browser with the provided session list.
+    /// Current working directory is expanded, all others collapsed.
     pub fn open(&mut self, sessions: Vec<SessionEntry>) {
+        // Collapse all dirs except current working dir
+        let cwd = std::env::current_dir()
+            .ok()
+            .map(|p| p.display().to_string().replace("/Users/fran", "~"))
+            .unwrap_or_default();
+        let mut dirs: std::collections::HashSet<String> = sessions.iter()
+            .map(|s| s.working_dir.clone())
+            .filter(|d| !d.is_empty())
+            .collect();
+        dirs.remove(&cwd);
+        self.collapsed_dirs = dirs;
         self.sessions = sessions;
         self.selected_idx = 0;
         self.mode = SessionBrowserMode::Browse;
         self.rename_input.clear();
         self.visible = true;
+    }
+
+    /// Build the flattened row list for rendering.
+    pub fn build_rows(&self) -> Vec<BrowserRow> {
+        let mut rows = Vec::new();
+        // Group sessions by working_dir
+        let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
+        let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for (i, s) in self.sessions.iter().enumerate() {
+            let dir = if s.working_dir.is_empty() { "(unknown)".to_string() } else { s.working_dir.clone() };
+            if let Some(&idx) = seen.get(&dir) {
+                groups[idx].1.push(i);
+            } else {
+                seen.insert(dir.clone(), groups.len());
+                groups.push((dir, vec![i]));
+            }
+        }
+        for (dir, indices) in &groups {
+            let collapsed = self.collapsed_dirs.contains(dir);
+            rows.push(BrowserRow::DirHeader {
+                path: dir.clone(),
+                count: indices.len(),
+                collapsed,
+            });
+            if !collapsed {
+                for &i in indices {
+                    rows.push(BrowserRow::Session { index: i });
+                }
+            }
+        }
+        rows
+    }
+
+    /// Toggle collapse state of the directory at the current selection.
+    pub fn toggle_dir(&mut self, dir: &str) {
+        if self.collapsed_dirs.contains(dir) {
+            self.collapsed_dirs.remove(dir);
+        } else {
+            self.collapsed_dirs.insert(dir.to_string());
+        }
     }
 
     /// Close the browser entirely.
@@ -237,77 +298,66 @@ pub fn render_session_browser(state: &SessionBrowserState, area: Rect, buf: &mut
     let mut lines: Vec<Line> = Vec::new();
 
     // --- Session list -----------------------------------------------------
-    if state.sessions.is_empty() {
+    let rows = state.build_rows();
+    if rows.is_empty() {
         lines.push(Line::from(""));
         lines.push(Line::from(vec![Span::styled(
             "  No sessions found.",
             Style::default().fg(Color::DarkGray),
         )]));
     } else {
-        // Column widths (approximate):
-        //   title: ~40 chars  |  date: ~14 chars  |  msgs: 5  |  cost: 9
         let date_w: usize = 14;
         let msgs_w: usize = 5;
-        let cost_w: usize = 9;
-        let fixed = date_w + msgs_w + cost_w + 6; // separators & padding
+        let fixed = date_w + msgs_w + 8;
         let title_w = inner_w.saturating_sub(fixed).max(10);
 
-        // Header row
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("  {:<title_w$}  {:<date_w$}  {:>msgs_w$}  {:>cost_w$}",
-                    "Title", "Last Updated", "Msgs", "Cost",
-                    title_w = title_w, date_w = date_w,
-                    msgs_w = msgs_w, cost_w = cost_w),
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::UNDERLINED),
-            ),
-        ]));
-        lines.push(Line::from(""));
+        let mut flat_idx: usize = 0;
 
-        for (i, session) in state.sessions.iter().enumerate() {
-            let is_selected = i == state.selected_idx;
+        for row in &rows {
+            let is_selected = flat_idx == state.selected_idx;
+            match row {
+                BrowserRow::DirHeader { path, count, collapsed } => {
+                    let arrow = if *collapsed { "\u{25b6}" } else { "\u{25bc}" };
+                    let label = format!(" {} {} ({} sessions)", arrow, path, count);
+                    let style = if is_selected {
+                        Style::default().fg(Color::Yellow).bg(Color::Rgb(40, 60, 80)).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(truncate_display(&label, inner_w), style),
+                    ]));
+                }
+                BrowserRow::Session { index } => {
+                    let session = &state.sessions[*index];
 
-            let title_cell = truncate_display(&session.title, title_w);
-            let date_cell = truncate_display(&session.last_updated, date_w);
-            let msgs_cell = format!("{:>msgs_w$}", session.message_count, msgs_w = msgs_w);
-            let cost_cell = format!("{:>cost_w$}", fmt_cost(session.cost_usd), cost_w = cost_w);
+                    let title_cell = truncate_display(&session.title, title_w);
+                    let date_cell = truncate_display(&session.last_updated, date_w);
+                    let msgs_cell = format!("{:>msgs_w$}", session.message_count, msgs_w = msgs_w);
 
-            let row_bg = if is_selected {
-                Color::Rgb(40, 60, 80)
-            } else {
-                // transparent — ratatui uses reset/default for "no background"
-                Color::Reset
-            };
+                    let row_bg = if is_selected { Color::Rgb(40, 60, 80) } else { Color::Reset };
+                    let title_style = if is_selected {
+                        Style::default().fg(Color::Cyan).bg(row_bg).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::White)
+                    };
+                    let meta_style = if is_selected {
+                        Style::default().fg(Color::Rgb(180, 200, 220)).bg(row_bg)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    };
 
-            let title_style = if is_selected {
-                Style::default()
-                    .fg(Color::Cyan)
-                    .bg(row_bg)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::White)
-            };
-
-            let meta_style = if is_selected {
-                Style::default().fg(Color::Rgb(180, 200, 220)).bg(row_bg)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-
-            let prefix_style = Style::default().bg(row_bg);
-
-            lines.push(Line::from(vec![
-                Span::styled("  ", prefix_style),
-                Span::styled(format!("{:<title_w$}", title_cell, title_w = title_w), title_style),
-                Span::styled("  ", meta_style),
-                Span::styled(format!("{:<date_w$}", date_cell, date_w = date_w), meta_style),
-                Span::styled("  ", meta_style),
-                Span::styled(msgs_cell, meta_style),
-                Span::styled("  ", meta_style),
-                Span::styled(cost_cell, meta_style),
-            ]));
+                    lines.push(Line::from(vec![
+                        Span::styled("    ", Style::default().bg(row_bg)),
+                        Span::styled(format!("{:<title_w$}", title_cell, title_w = title_w), title_style),
+                        Span::styled("  ", meta_style),
+                        Span::styled(format!("{:<date_w$}", date_cell, date_w = date_w), meta_style),
+                        Span::styled("  ", meta_style),
+                        Span::styled(msgs_cell, meta_style),
+                    ]));
+                }
+            }
+            flat_idx += 1;
         }
     }
 

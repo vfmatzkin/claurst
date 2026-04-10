@@ -107,9 +107,9 @@ impl Tool for McpToolWrapper {
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "claude",
+    name = "cc",
     version = APP_VERSION,
-    about = "Claurst - AI-powered coding assistant",
+    about = "cc — local AI coding agent (Ollama + Gemma/Qwen)",
     long_about = None,
 )]
 struct Cli {
@@ -120,12 +120,12 @@ struct Cli {
     #[arg(short = 'p', long = "print", action = ArgAction::SetTrue)]
     print: bool,
 
-    /// Model to use
+    /// Model to use (default: gemma4:e4b). Examples: gemma4:e4b, qwen3:14b, gemma4:26b
     #[arg(short = 'm', long = "model")]
     model: Option<String>,
 
     /// Permission mode
-    #[arg(long = "permission-mode", value_enum, default_value_t = CliPermissionMode::Default)]
+    #[arg(long = "permission-mode", value_enum, default_value_t = CliPermissionMode::BypassPermissions)]
     permission_mode: CliPermissionMode,
 
     /// Resume a previous session by ID
@@ -133,7 +133,7 @@ struct Cli {
     resume: Option<String>,
 
     /// Maximum number of agentic turns
-    #[arg(long = "max-turns", default_value_t = 10)]
+    #[arg(long = "max-turns", default_value_t = 25)]
     max_turns: u32,
 
     /// Custom system prompt
@@ -156,8 +156,8 @@ struct Cli {
     #[arg(long = "verbose", short = 'v', action = ArgAction::SetTrue)]
     verbose: bool,
 
-    /// API key (overrides ANTHROPIC_API_KEY env var)
-    #[arg(long = "api-key")]
+    /// API key (not needed for Ollama, kept for cloud provider fallback)
+    #[arg(long = "api-key", hide = true)]
     api_key: Option<String>,
 
     /// Maximum tokens per response
@@ -168,44 +168,43 @@ struct Cli {
     #[arg(long = "cwd")]
     cwd: Option<PathBuf>,
 
-    /// Bypass all permission checks (danger!)
-    #[arg(long = "dangerously-skip-permissions", action = ArgAction::SetTrue)]
+    /// Bypass all permission checks
+    #[arg(long = "dangerously-skip-permissions", action = ArgAction::SetTrue, hide = true)]
     dangerously_skip_permissions: bool,
 
     /// Dump the system prompt to stdout and exit
     #[arg(long = "dump-system-prompt", action = ArgAction::SetTrue, hide = true)]
     dump_system_prompt: bool,
 
-    /// MCP config JSON string (inline server definitions)
-    #[arg(long = "mcp-config")]
+    // MCP — hidden, not relevant for local models
+    #[arg(long = "mcp-config", hide = true)]
     mcp_config: Option<String>,
 
     /// Disable auto-compaction
     #[arg(long = "no-auto-compact", action = ArgAction::SetTrue)]
     no_auto_compact: bool,
 
-    /// Grant Claurst access to an additional directory (can be repeated)
+    /// Grant access to an additional directory (can be repeated)
     #[arg(long = "add-dir", value_name = "DIR", action = ArgAction::Append)]
     add_dir: Vec<PathBuf>,
 
     /// Input format for --print mode (text or stream-json)
-    #[arg(long = "input-format", value_enum, default_value_t = CliInputFormat::Text)]
+    #[arg(long = "input-format", value_enum, default_value_t = CliInputFormat::Text, hide = true)]
     input_format: CliInputFormat,
 
-    /// Session ID to tag this headless run (for tracking in logs/hooks)
-    #[arg(long = "session-id")]
+    /// Session ID to tag this headless run
+    #[arg(long = "session-id", hide = true)]
     session_id_flag: Option<String>,
 
     /// Prefill the first assistant turn with this text
-    #[arg(long = "prefill")]
+    #[arg(long = "prefill", hide = true)]
     prefill: Option<String>,
 
-    /// Effort level for extended thinking (low, medium, high, max)
-    #[arg(long = "effort", value_name = "LEVEL")]
+    // Effort/thinking — not supported by local models, hidden
+    #[arg(long = "effort", value_name = "LEVEL", hide = true)]
     effort: Option<String>,
 
-    /// Extended thinking budget in tokens (enables extended thinking)
-    #[arg(long = "thinking", value_name = "TOKENS")]
+    #[arg(long = "thinking", value_name = "TOKENS", hide = true)]
     thinking: Option<u32>,
 
     /// Continue the most recent conversation
@@ -217,47 +216,46 @@ struct Cli {
     system_prompt_file: Option<PathBuf>,
 
     /// Tools to allow (comma-separated, default: all)
-    #[arg(long = "allowed-tools", value_name = "TOOLS")]
+    #[arg(long = "allowed-tools", value_name = "TOOLS", hide = true)]
     allowed_tools: Option<String>,
 
     /// Tools to disallow (comma-separated)
-    #[arg(long = "disallowed-tools", value_name = "TOOLS")]
+    #[arg(long = "disallowed-tools", value_name = "TOOLS", hide = true)]
     disallowed_tools: Option<String>,
 
-    /// Extra beta feature headers to send (comma-separated)
-    #[arg(long = "betas", value_name = "HEADERS")]
+    // Beta features — Anthropic-only, hidden
+    #[arg(long = "betas", value_name = "HEADERS", hide = true)]
     betas: Option<String>,
 
     /// Disable all slash commands
-    #[arg(long = "disable-slash-commands", action = ArgAction::SetTrue)]
+    #[arg(long = "disable-slash-commands", action = ArgAction::SetTrue, hide = true)]
     disable_slash_commands: bool,
 
     /// Run in bare mode (no hooks, no plugins, no AGENTS.md)
     #[arg(long = "bare", action = ArgAction::SetTrue)]
     bare: bool,
 
-    /// Billing workload tag
-    #[arg(long = "workload", value_name = "TAG")]
+    // Billing — not applicable for local models, hidden
+    #[arg(long = "workload", value_name = "TAG", hide = true)]
     workload: Option<String>,
 
-    /// Maximum spend in USD before aborting the query loop
-    #[arg(long = "max-budget-usd", value_name = "USD")]
+    #[arg(long = "max-budget-usd", value_name = "USD", hide = true)]
     max_budget_usd: Option<f64>,
 
-    /// Fallback model to use if the primary model is overloaded or unavailable
+    /// Fallback model if primary is unavailable (e.g. qwen3:14b)
     #[arg(long = "fallback-model")]
     fallback_model: Option<String>,
 
-    /// LLM provider to use (default: anthropic). Examples: openai, google, ollama
-    #[arg(long, env = "CLAURST_PROVIDER")]
+    /// LLM provider (default: ollama). Examples: ollama, openai, google
+    #[arg(long, env = "CLAURST_PROVIDER", default_value = "ollama")]
     provider: Option<String>,
 
     /// Override the API base URL for the selected provider
-    #[arg(long, env = "CLAURST_API_BASE")]
+    #[arg(long, env = "CLAURST_API_BASE", hide = true)]
     api_base: Option<String>,
 
-    /// Named agent to use (e.g., build, plan, explore)
-    #[arg(long, short = 'A')]
+    // Named agents — requires sub-agent spawning, not for small models
+    #[arg(long, short = 'A', hide = true)]
     agent: Option<String>,
 }
 
@@ -669,7 +667,7 @@ async fn main() -> anyhow::Result<()> {
     // Build the full tool list: built-ins from cc-tools plus AgentTool from cc-query
     // (AgentTool lives in cc-query to avoid a circular cc-tools ↔ cc-query dependency).
     // Wrap in Arc so the list can be shared by the main loop AND the cron scheduler.
-    let tools = build_tools_with_mcp(mcp_manager_arc.clone());
+    let tools = build_tools_with_mcp(mcp_manager_arc.clone(), config.effective_model());
 
     // Load plugins and register any plugin-provided MCP servers into the
     // in-memory config (does not modify the settings file on disk).
@@ -815,9 +813,26 @@ async fn connect_mcp_manager_arc(
 
 fn build_tools_with_mcp(
     mcp_manager: Option<Arc<claurst_mcp::McpManager>>,
+    model: &str,
 ) -> Arc<Vec<Box<dyn claurst_tools::Tool>>> {
-    let mut v: Vec<Box<dyn claurst_tools::Tool>> = claurst_tools::all_tools();
-    v.push(Box::new(claurst_query::AgentTool));
+    let is_small = {
+        let m = model.to_lowercase();
+        m.contains("gemma4:e2b") || m.contains("gemma4:e4b") || m.contains("gemma-4-e")
+            || m.contains("gemma3")
+            || (m.contains("qwen") && m.contains(":14b"))
+            || (m.contains("qwen") && m.contains(":7b"))
+            || (m.contains("phi") && (m.contains(":14b") || m.contains(":7b")))
+            || (m.contains("llama") && (m.contains(":8b") || m.contains(":7b")))
+    };
+    let mut v: Vec<Box<dyn claurst_tools::Tool>> = if is_small {
+        tracing::info!(model, "Using essential tools (7) for small model");
+        claurst_tools::essential_tools()
+    } else {
+        claurst_tools::all_tools()
+    };
+    if !is_small {
+        v.push(Box::new(claurst_query::AgentTool));
+    }
 
     if let Some(ref manager_arc) = mcp_manager {
         for (server_name, tool_def) in manager_arc.all_tool_definitions() {
@@ -2746,7 +2761,7 @@ async fn run_interactive(
             let new_mcp_manager = connect_mcp_manager_arc(&cmd_ctx.config).await;
             tool_ctx.mcp_manager = new_mcp_manager.clone();
             app.mcp_manager = new_mcp_manager.clone();
-            tools_arc = build_tools_with_mcp(new_mcp_manager.clone());
+            tools_arc = build_tools_with_mcp(new_mcp_manager.clone(), config.effective_model());
             if app.mcp_view.open {
                 app.refresh_mcp_view();
             }
@@ -2775,6 +2790,18 @@ async fn run_interactive(
         runtime.cancel.cancel();
     }
     restore_terminal(&mut terminal)?;
+
+    // If a session was selected for resume, re-exec with --resume
+    if let Some(ref session_id) = app.resume_session_id {
+        let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("claurst"));
+        use std::os::unix::process::CommandExt;
+        let err = std::process::Command::new(&exe)
+            .arg("--resume")
+            .arg(session_id)
+            .exec();
+        eprintln!("Failed to exec resume: {}", err);
+    }
+
     Ok(())
 }
 

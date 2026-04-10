@@ -625,6 +625,8 @@ pub struct App {
     /// Randomly chosen thinking verb shown next to the spinner while streaming.
     pub spinner_verb: Option<String>,
     pub should_quit: bool,
+    /// Session ID to resume after closing the current session.
+    pub resume_session_id: Option<String>,
     pub show_help: bool,
 
     // Extended state
@@ -1113,6 +1115,7 @@ impl App {
             status_message: None,
             spinner_verb: None,
             should_quit: false,
+            resume_session_id: None,
             show_help: false,
             tool_use_blocks: Vec::new(),
             permission_request: None,
@@ -1813,8 +1816,54 @@ impl App {
                 true
             }
             "session" | "resume" => {
-                self.session_browser.open(vec![]);
-                self.session_list_pending = true;
+                // Load sessions synchronously to avoid async channel timing issues
+                let sessions = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(
+                        claurst_core::history::list_sessions()
+                    )
+                });
+                let entries: Vec<crate::session_browser::SessionEntry> = sessions
+                    .into_iter()
+                    .map(|s| {
+                        let age = chrono::Utc::now().signed_duration_since(s.updated_at);
+                        let last_updated = if age.num_minutes() < 1 {
+                            "just now".to_string()
+                        } else if age.num_hours() < 1 {
+                            format!("{}m ago", age.num_minutes())
+                        } else if age.num_hours() < 24 {
+                            format!("{}h ago", age.num_hours())
+                        } else {
+                            format!("{}d ago", age.num_days())
+                        };
+                        // Use first user message or date as title fallback
+                        let title = s.title.unwrap_or_else(|| {
+                            // Try to extract first user message as title
+                            let first_msg = s.messages.iter()
+                                .find(|m| m.role == claurst_core::types::Role::User)
+                                .and_then(|m| m.get_text())
+                                .map(|t| {
+                                    let short: String = t.chars().take(50).collect();
+                                    if t.len() > 50 { format!("{}...", short) } else { short }
+                                });
+                            first_msg.unwrap_or_else(|| {
+                                s.created_at.format("%Y-%m-%d %H:%M").to_string()
+                            })
+                        });
+                        let working_dir = s.working_dir
+                            .as_deref()
+                            .unwrap_or("")
+                            .replace("/Users/fran", "~")
+                            .to_string();
+                        crate::session_browser::SessionEntry {
+                            id: s.id,
+                            title,
+                            last_updated,
+                            message_count: s.messages.len(),
+                            working_dir,
+                        }
+                    })
+                    .collect();
+                self.session_browser.open(entries);
                 true
             }
             "clear" => {
@@ -2883,9 +2932,54 @@ impl App {
                 SessionBrowserMode::Browse => {
                     match key.code {
                         KeyCode::Esc => self.session_browser.close(),
-                        KeyCode::Up => self.session_browser.select_prev(),
-                        KeyCode::Down => self.session_browser.select_next(),
+                        KeyCode::Up => {
+                            let row_count = self.session_browser.build_rows().len();
+                            if row_count > 0 && self.session_browser.selected_idx > 0 {
+                                self.session_browser.selected_idx -= 1;
+                            } else if row_count > 0 {
+                                self.session_browser.selected_idx = row_count - 1;
+                            }
+                        }
+                        KeyCode::Down => {
+                            let row_count = self.session_browser.build_rows().len();
+                            if row_count > 0 {
+                                self.session_browser.selected_idx = (self.session_browser.selected_idx + 1) % row_count;
+                            }
+                        }
                         KeyCode::Char('r') => self.session_browser.start_rename(),
+                        KeyCode::Enter | KeyCode::Tab => {
+                            // Check if current selection is on a dir header — toggle it
+                            let rows = self.session_browser.build_rows();
+                            let mut flat_idx = 0;
+                            let mut on_dir: Option<String> = None;
+                            let mut on_session: Option<usize> = None;
+                            for row in &rows {
+                                match row {
+                                    crate::session_browser::BrowserRow::DirHeader { path, .. } => {
+                                        if flat_idx == self.session_browser.selected_idx {
+                                            on_dir = Some(path.clone());
+                                        }
+                                        flat_idx += 1;
+                                    }
+                                    crate::session_browser::BrowserRow::Session { index } => {
+                                        if flat_idx == self.session_browser.selected_idx {
+                                            on_session = Some(*index);
+                                        }
+                                        flat_idx += 1;
+                                    }
+                                }
+                            }
+                            if let Some(dir) = on_dir {
+                                self.session_browser.toggle_dir(&dir);
+                            } else if let Some(idx) = on_session {
+                                if let Some(entry) = self.session_browser.sessions.get(idx) {
+                                    let session_id = entry.id.clone();
+                                    self.session_browser.close();
+                                    self.resume_session_id = Some(session_id);
+                                    self.should_quit = true;
+                                }
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -5103,6 +5197,7 @@ impl App {
             if let Some(ref mut rx) = self.session_list_rx {
                 match rx.try_recv() {
                     Ok(entries) => {
+                        eprintln!("[DEBUG] Received {} entries for session browser", entries.len());
                         self.session_browser.sessions = entries;
                         self.session_browser.selected_idx = 0;
                         self.session_list_rx = None;
@@ -5121,6 +5216,7 @@ impl App {
                 self.session_list_rx = Some(rx);
                 tokio::spawn(async move {
                     let sessions = claurst_core::history::list_sessions().await;
+                    eprintln!("[DEBUG] list_sessions returned {} sessions", sessions.len());
                     let entries: Vec<crate::session_browser::SessionEntry> = sessions
                         .into_iter()
                         .map(|s| {
@@ -5135,12 +5231,20 @@ impl App {
                             } else {
                                 format!("{}d ago", age.num_days())
                             };
+                            let title = s.title.unwrap_or_else(|| {
+                                s.created_at.format("%Y-%m-%d %H:%M").to_string()
+                            });
+                            let working_dir = s.working_dir
+                                .as_deref()
+                                .unwrap_or("")
+                                .replace("/Users/fran", "~")
+                                .to_string();
                             crate::session_browser::SessionEntry {
                                 id: s.id,
-                                title: s.title.unwrap_or_else(|| "(untitled)".to_string()),
+                                title,
                                 last_updated,
                                 message_count: s.messages.len(),
-                                cost_usd: s.total_cost,
+                                working_dir,
                             }
                         })
                         .collect();

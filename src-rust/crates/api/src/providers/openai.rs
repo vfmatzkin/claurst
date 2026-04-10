@@ -242,6 +242,7 @@ impl OpenAiProvider {
         };
 
         let mut text_parts: Vec<&str> = Vec::new();
+        let mut thinking_parts: Vec<&str> = Vec::new();
         let mut tool_calls: Vec<Value> = Vec::new();
 
         for block in blocks {
@@ -260,13 +261,21 @@ impl OpenAiProvider {
                         }
                     }));
                 }
-                // Thinking is dropped — not supported by OpenAI.
+                ContentBlock::Thinking { thinking, .. } => {
+                    thinking_parts.push(thinking.as_str());
+                }
                 _ => {}
             }
         }
 
+        // If no text content but thinking exists, use thinking as content
+        // to prevent sending null content which breaks Ollama/local providers.
         let text_content = if text_parts.is_empty() {
-            None
+            if thinking_parts.is_empty() {
+                None
+            } else {
+                Some(thinking_parts.join("\n"))
+            }
         } else {
             Some(text_parts.join(""))
         };

@@ -213,6 +213,7 @@ pub mod types {
         },
         Thinking {
             thinking: String,
+            #[serde(default)]
             signature: String,
         },
         RedactedThinking {
@@ -966,7 +967,7 @@ pub mod config {
                 Some("cohere") => "command-r-plus",
                 Some("deepinfra") => "meta-llama/Llama-3.3-70B-Instruct",
                 Some("github-copilot") => "gpt-4o",
-                Some("ollama") => "llama3.2",
+                Some("ollama") => "gemma4:e4b",
                 Some("lmstudio") => "default",
                 Some("llamacpp") => "default",
                 Some("azure") => "gpt-4o",

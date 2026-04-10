@@ -36,14 +36,33 @@ pub fn calculate_context_window_usage(messages: &[Message], model: &str) -> Cont
 
 /// Return the context window token limit for a known model.
 pub fn context_window_for_model(model: &str) -> u64 {
-    if model.contains("claude-3-5-haiku") { return 200_000; }
-    if model.contains("claude-3-5-sonnet") { return 200_000; }
-    if model.contains("claude-3-7-sonnet") { return 200_000; }
-    if model.contains("claude-sonnet-4") { return 200_000; }
-    if model.contains("claude-opus-4") { return 200_000; }
-    if model.contains("opus") { return 200_000; }
-    if model.contains("haiku") { return 200_000; }
-    200_000 // safe default
+    let m = model.to_lowercase();
+
+    // Claude family
+    if m.contains("claude-3-5-haiku") { return 200_000; }
+    if m.contains("claude-3-5-sonnet") { return 200_000; }
+    if m.contains("claude-3-7-sonnet") { return 200_000; }
+    if m.contains("claude-sonnet-4") { return 200_000; }
+    if m.contains("claude-opus-4") { return 200_000; }
+    if m.contains("opus") { return 200_000; }
+    if m.contains("haiku") { return 200_000; }
+
+    // Gemma 4 — practical sweet-spots, not theoretical max
+    if m.contains("gemma4:e2b") || m.contains("gemma4:e4b") || m.contains("gemma-4-e") {
+        return 32_000;
+    }
+    if m.contains("gemma4") || m.contains("gemma-4") { return 64_000; }
+    if m.contains("gemma3") || m.contains("gemma-3") { return 32_000; }
+
+    // Qwen — 32K native
+    if m.contains("qwen") { return 32_000; }
+
+    // Phi, Llama, Mistral
+    if m.contains("phi") { return 16_000; }
+    if m.contains("llama") { return 32_000; }
+    if m.contains("mistral") || m.contains("nemo") { return 32_000; }
+
+    200_000 // safe default for cloud models
 }
 
 // ---------------------------------------------------------------------------

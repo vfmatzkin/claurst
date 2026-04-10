@@ -152,8 +152,10 @@ impl Default for QueryConfig {
 
 impl QueryConfig {
     pub fn from_config(cfg: &Config) -> Self {
+        let model = cfg.effective_model().to_string();
+        let budget = Self::tool_result_budget_for_model(&model);
         Self {
-            model: cfg.effective_model().to_string(),
+            model,
             max_tokens: cfg.effective_max_tokens(),
             output_style: cfg.effective_output_style(),
             output_style_prompt: cfg.resolve_output_style_prompt(),
@@ -161,6 +163,7 @@ impl QueryConfig {
                 .project_dir
                 .as_ref()
                 .map(|p| p.display().to_string()),
+            tool_result_budget: budget,
             ..Default::default()
         }
     }
@@ -170,10 +173,10 @@ impl QueryConfig {
     /// Prefers the best model for the configured provider (from models.dev data)
     /// over the hardcoded defaults.
     pub fn from_config_with_registry(cfg: &Config, registry: &claurst_api::ModelRegistry) -> Self {
-        // We can't move the Arc here, but we need a clone for the query loop.
-        // Callers typically wrap the registry in an Arc already.
+        let model = claurst_api::effective_model_for_config(cfg, registry);
+        let budget = Self::tool_result_budget_for_model(&model);
         Self {
-            model: claurst_api::effective_model_for_config(cfg, registry),
+            model,
             max_tokens: cfg.effective_max_tokens(),
             output_style: cfg.effective_output_style(),
             output_style_prompt: cfg.resolve_output_style_prompt(),
@@ -181,7 +184,22 @@ impl QueryConfig {
                 .project_dir
                 .as_ref()
                 .map(|p| p.display().to_string()),
+            tool_result_budget: budget,
             ..Default::default()
+        }
+    }
+
+    /// Scale tool result budget based on model context window.
+    /// Small local models get a proportionally smaller budget.
+    fn tool_result_budget_for_model(model: &str) -> usize {
+        let ctx = context_window_for_model(model);
+        if ctx <= 32_000 {
+            // ~32K context: keep budget at ~10K chars (leaves room for system prompt + conversation)
+            10_000
+        } else if ctx <= 64_000 {
+            25_000
+        } else {
+            50_000
         }
     }
 }
@@ -1994,6 +2012,7 @@ fn build_system_prompt(config: &QueryConfig) -> SystemPrompt {
         output_style: config.output_style,
         custom_output_style_prompt: config.output_style_prompt.clone(),
         working_directory: config.working_directory.clone(),
+        model_name: Some(config.model.clone()),
         ..Default::default()
     };
 

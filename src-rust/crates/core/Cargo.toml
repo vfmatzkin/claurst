@@ -104,3 +104,7 @@ cpal = { version = "0.15", optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+
+[[example]]
+name = "test_deser"
+path = "/tmp/test_deser.rs"

@@ -39,7 +39,12 @@ const AUTOCOMPACT_BUFFER_TOKENS: u64 = 13_000;
 const WARNING_THRESHOLD_BUFFER_TOKENS: u64 = 20_000;
 
 /// Fraction of the context window at which auto-compact triggers.
-const AUTOCOMPACT_TRIGGER_FRACTION: f64 = 0.90;
+/// Scales down for smaller context windows.
+fn autocompact_trigger_fraction(context_window: u64) -> f64 {
+    if context_window <= 32_000 { 0.70 }
+    else if context_window <= 64_000 { 0.80 }
+    else { 0.90 }
+}
 
 /// How many recent messages to preserve verbatim after compaction.
 const KEEP_RECENT_MESSAGES: usize = 10;
@@ -47,9 +52,14 @@ const KEEP_RECENT_MESSAGES: usize = 10;
 /// Max consecutive auto-compact failures before giving up (circuit breaker).
 const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 
-// Percentage thresholds for token warning states (mirrors TS autoCompact.ts)
-const WARNING_PCT: f64 = 0.80;   // 80 % full → yellow warning
-const CRITICAL_PCT: f64 = 0.95;  // 95 % full → red critical
+// Percentage thresholds for token warning states.
+// Scale down for smaller context windows.
+fn warning_pct(context_window: u64) -> f64 {
+    if context_window <= 32_000 { 0.60 } else { 0.80 }
+}
+fn critical_pct(context_window: u64) -> f64 {
+    if context_window <= 32_000 { 0.80 } else { 0.95 }
+}
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -487,13 +497,53 @@ pub fn format_compact_summary(raw: &str) -> String {
 /// Return the effective context-window size in tokens for the given model.
 /// These are approximate; the API enforces the real limits server-side.
 pub fn context_window_for_model(model: &str) -> u64 {
-    if model.contains("opus-4") || model.contains("sonnet-4") || model.contains("haiku-4") {
-        200_000
-    } else if model.contains("claude-3-5") || model.contains("claude-3.5") {
-        200_000
-    } else {
-        100_000
+    let m = model.to_lowercase();
+
+    // Claude family
+    if m.contains("opus-4") || m.contains("sonnet-4") || m.contains("haiku-4") {
+        return 200_000;
     }
+    if m.contains("claude-3-5") || m.contains("claude-3.5") {
+        return 200_000;
+    }
+
+    // Gemma 4 family — use practical sweet-spot, not theoretical max
+    // E2B/E4B have 128K max but quality degrades past 32K with 4B active params
+    if m.contains("gemma4:e2b") || m.contains("gemma4:e4b") || m.contains("gemma-4-e") {
+        return 32_000;
+    }
+    // Gemma 4 26B/31B have 256K max, use 64K sweet-spot
+    if m.contains("gemma4") || m.contains("gemma-4") {
+        return 64_000;
+    }
+    // Gemma 3
+    if m.contains("gemma3") || m.contains("gemma-3") {
+        return 32_000;
+    }
+
+    // Qwen family
+    if m.contains("qwen") {
+        // Qwen3 supports 32K native, 128K with YaRN
+        return 32_000;
+    }
+
+    // Phi family
+    if m.contains("phi") {
+        return 16_000;
+    }
+
+    // Llama family
+    if m.contains("llama") {
+        return 32_000;
+    }
+
+    // Mistral family
+    if m.contains("mistral") || m.contains("nemo") {
+        return 32_000;
+    }
+
+    // Default for unknown models — conservative for local models
+    100_000
 }
 
 /// Determine token-warning state given current input token count and model.
@@ -506,9 +556,9 @@ pub fn calculate_token_warning_state(input_tokens: u64, model: &str) -> TokenWar
     let window = context_window_for_model(model);
     let pct = input_tokens as f64 / window as f64;
 
-    if pct >= CRITICAL_PCT {
+    if pct >= critical_pct(window) {
         TokenWarningState::Critical
-    } else if pct >= WARNING_PCT || window.saturating_sub(input_tokens) <= WARNING_THRESHOLD_BUFFER_TOKENS {
+    } else if pct >= warning_pct(window) || window.saturating_sub(input_tokens) <= WARNING_THRESHOLD_BUFFER_TOKENS {
         TokenWarningState::Warning
     } else {
         TokenWarningState::Ok
@@ -521,7 +571,7 @@ pub fn should_auto_compact(input_tokens: u64, model: &str, state: &AutoCompactSt
         return false;
     }
     let window = context_window_for_model(model);
-    let threshold = (window as f64 * AUTOCOMPACT_TRIGGER_FRACTION) as u64;
+    let threshold = (window as f64 * autocompact_trigger_fraction(window)) as u64;
     input_tokens >= threshold
 }
 
@@ -763,20 +813,21 @@ pub fn should_compact(tokens_used: u64, context_limit: u64) -> bool {
     if context_limit == 0 {
         return false;
     }
-    let threshold = (context_limit as f64 * REACTIVE_COMPACT_THRESHOLD) as u64;
+    let threshold = (context_limit as f64 * reactive_compact_threshold(context_limit)) as u64;
     tokens_used >= threshold
 }
 
-/// Return `true` when the emergency context-collapse should fire (≥ 97 %).
+/// Return `true` when the emergency context-collapse should fire.
 ///
 /// Context-collapse is a last-resort measure: it produces an ultra-short
 /// summary and keeps only the most recent user turn so that the next API call
 /// can succeed even when the conversation is severely over-limit.
+/// Threshold scales by model size: 85% for ≤32K, 90% for ≤64K, 97% for larger.
 pub fn should_context_collapse(tokens_used: u64, context_limit: u64) -> bool {
     if context_limit == 0 {
         return false;
     }
-    let threshold = (context_limit as f64 * CONTEXT_COLLAPSE_THRESHOLD) as u64;
+    let threshold = (context_limit as f64 * context_collapse_threshold(context_limit)) as u64;
     tokens_used >= threshold
 }
 
@@ -1070,10 +1121,22 @@ pub async fn context_collapse(
 }
 
 // Threshold constants for reactive compact / context-collapse.
-/// Reactive compact fires at 90 % of the context window.
-const REACTIVE_COMPACT_THRESHOLD: f64 = 0.90;
-/// Context collapse (emergency) fires at 97 % of the context window.
-const CONTEXT_COLLAPSE_THRESHOLD: f64 = 0.97;
+// For small local models (≤32K context), thresholds are tighter to avoid
+// quality degradation at high context utilization.
+
+/// Reactive compact threshold: fires earlier for small models.
+fn reactive_compact_threshold(context_limit: u64) -> f64 {
+    if context_limit <= 32_000 { 0.70 }
+    else if context_limit <= 64_000 { 0.80 }
+    else { 0.90 }
+}
+
+/// Context collapse (emergency) threshold: fires earlier for small models.
+fn context_collapse_threshold(context_limit: u64) -> f64 {
+    if context_limit <= 32_000 { 0.85 }
+    else if context_limit <= 64_000 { 0.90 }
+    else { 0.97 }
+}
 
 // ---------------------------------------------------------------------------
 // T4-5: Collapse read/search results (mirrors src/utils/collapseReadSearch.ts)

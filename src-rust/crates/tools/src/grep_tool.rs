@@ -9,7 +9,23 @@ use std::path::PathBuf;
 use tracing::debug;
 use walkdir::WalkDir;
 
-pub struct GrepTool;
+pub struct GrepTool {
+    /// When true, default to "content" output mode and simplified schema.
+    pub small_model_mode: bool,
+}
+
+impl GrepTool {
+    pub fn new() -> Self {
+        Self { small_model_mode: false }
+    }
+    pub fn for_small_model() -> Self {
+        Self { small_model_mode: true }
+    }
+}
+
+impl Default for GrepTool {
+    fn default() -> Self { Self::new() }
+}
 
 #[derive(Debug, Deserialize)]
 struct GrepInput {
@@ -72,10 +88,15 @@ impl Tool for GrepTool {
     }
 
     fn description(&self) -> &str {
-        "A powerful search tool built on regex. Supports full regex syntax. \
-         Filter files with the `glob` parameter or `type` parameter. Output \
-         modes: \"content\" shows matching lines, \"files_with_matches\" shows \
-         only file paths (default), \"count\" shows match counts."
+        if self.small_model_mode {
+            "Search file contents using regex. Returns matching lines with line numbers. \
+             Use `path` to target a specific file or directory. Use `context` to see surrounding lines."
+        } else {
+            "A powerful search tool built on regex. Supports full regex syntax. \
+             Filter files with the `glob` parameter or `type` parameter. Output \
+             modes: \"content\" shows matching lines, \"files_with_matches\" shows \
+             only file paths (default), \"count\" shows match counts."
+        }
     }
 
     fn permission_level(&self) -> PermissionLevel {
@@ -133,10 +154,22 @@ impl Tool for GrepTool {
     }
 
     async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
-        let params: GrepInput = match serde_json::from_value(input) {
+        let mut params: GrepInput = match serde_json::from_value(input) {
             Ok(p) => p,
             Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
         };
+
+        // For small models: always default to "content" mode with line numbers
+        // and add context lines so the model sees surrounding code.
+        if self.small_model_mode && params.output_mode == "files_with_matches" {
+            params.output_mode = "content".to_string();
+            if params.context.is_none() {
+                params.context = Some(2);
+            }
+            if params.show_line_numbers.is_none() {
+                params.show_line_numbers = Some(true);
+            }
+        }
 
         let search_path = params
             .path

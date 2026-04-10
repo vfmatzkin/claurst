@@ -1,4 +1,5 @@
 // FileRead tool: read files with optional line range, image support, PDF page ranges.
+// Adapted for small local models: reduced default limits, large-file guidance.
 
 use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;
@@ -6,7 +7,33 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tracing::debug;
 
-pub struct FileReadTool;
+/// Default line limit for large cloud models.
+const DEFAULT_LINE_LIMIT: usize = 2000;
+/// Reduced line limit for small local models to conserve context.
+const SMALL_MODEL_LINE_LIMIT: usize = 500;
+/// Files above this line count trigger a guidance message for small models.
+const LARGE_FILE_GUIDANCE_THRESHOLD: usize = 300;
+
+pub struct FileReadTool {
+    /// When true, use reduced limits and emit guidance for large files.
+    pub small_model_mode: bool,
+}
+
+impl FileReadTool {
+    pub fn new() -> Self {
+        Self { small_model_mode: false }
+    }
+
+    pub fn for_small_model() -> Self {
+        Self { small_model_mode: true }
+    }
+}
+
+impl Default for FileReadTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[derive(Debug, Deserialize)]
 struct FileReadInput {
@@ -24,10 +51,16 @@ impl Tool for FileReadTool {
     }
 
     fn description(&self) -> &str {
-        "Reads a file from the local filesystem. You can access any file directly. \
-         By default reads up to 2000 lines from the beginning. Results are returned \
-         with line numbers starting at 1. This tool can read images (PNG, JPG) and \
-         PDF files."
+        if self.small_model_mode {
+            "Reads a file from the filesystem. Default limit: 500 lines. \
+             IMPORTANT: For files over 300 lines, use Grep first to find relevant \
+             line numbers, then Read with offset/limit to get only the section you need."
+        } else {
+            "Reads a file from the local filesystem. You can access any file directly. \
+             By default reads up to 2000 lines from the beginning. Results are returned \
+             with line numbers starting at 1. This tool can read images (PNG, JPG) and \
+             PDF files."
+        }
     }
 
     fn permission_level(&self) -> PermissionLevel {
@@ -124,8 +157,49 @@ impl Tool for FileReadTool {
         let lines: Vec<&str> = content.lines().collect();
         let total_lines = lines.len();
 
+        let default_limit = if self.small_model_mode {
+            SMALL_MODEL_LINE_LIMIT
+        } else {
+            DEFAULT_LINE_LIMIT
+        };
+
         let offset = params.offset.unwrap_or(0);
-        let limit = params.limit.unwrap_or(2000);
+        let limit = params.limit.unwrap_or(default_limit);
+
+        // For small models: if reading a large file without offset/limit,
+        // return a summary with guidance instead of dumping content
+        if self.small_model_mode
+            && total_lines > LARGE_FILE_GUIDANCE_THRESHOLD
+            && params.offset.is_none()
+            && params.limit.is_none()
+        {
+            // Still return the first chunk, but prepend guidance
+            let effective_limit = limit.min(total_lines);
+            let start = 0;
+            let end = effective_limit.min(total_lines);
+
+            let mut output = format!(
+                "[Large file: {} lines total. Showing first {}. \
+                 TIP: Use Grep to find specific sections, then Read with offset/limit.]\n\n",
+                total_lines, end
+            );
+
+            let width = format!("{}", end).len();
+            for (i, line) in lines[start..end].iter().enumerate() {
+                let line_num = i + 1;
+                output.push_str(&format!("{:>width$}\t{}\n", line_num, line, width = width));
+            }
+
+            if end < total_lines {
+                output.push_str(&format!(
+                    "\n... ({} more lines, {} total. Use offset/limit to read more.)\n",
+                    total_lines - end,
+                    total_lines
+                ));
+            }
+
+            return ToolResult::success(output);
+        }
 
         // Convert 1-based offset to 0-based index
         let start = if offset > 0 { offset - 1 } else { 0 };

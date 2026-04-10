@@ -337,15 +337,20 @@ pub trait Tool: Send + Sync {
 
 /// Return all built-in tools (excluding AgentTool, which lives in cc-query).
 pub fn all_tools() -> Vec<Box<dyn Tool>> {
+    full_tools()
+}
+
+/// Full tool set for large cloud models.
+fn full_tools() -> Vec<Box<dyn Tool>> {
     vec![
         Box::new(PtyBashTool),
-        Box::new(FileReadTool),
+        Box::new(FileReadTool::new()),
         Box::new(FileEditTool),
         Box::new(FileWriteTool),
         Box::new(BatchEditTool),
         Box::new(ApplyPatchTool),
         Box::new(GlobTool),
-        Box::new(GrepTool),
+        Box::new(GrepTool::new()),
         Box::new(WebFetchTool),
         Box::new(WebSearchTool),
         Box::new(NotebookEditTool),
@@ -383,6 +388,21 @@ pub fn all_tools() -> Vec<Box<dyn Tool>> {
         // Computer Use is only available when compiled with the feature flag.
         #[cfg(feature = "computer-use")]
         Box::new(computer_use::ComputerUseTool),
+    ]
+}
+
+/// Minimal tool set for small local models (≤14B params).
+/// Only 7 tools — keeps tool definitions small enough for models with
+/// limited context and instruction-following capacity.
+pub fn essential_tools() -> Vec<Box<dyn Tool>> {
+    vec![
+        Box::new(PtyBashTool),
+        Box::new(FileReadTool::for_small_model()),
+        Box::new(FileEditTool),
+        Box::new(FileWriteTool),
+        Box::new(GlobTool),
+        Box::new(GrepTool::for_small_model()),
+        Box::new(AskUserQuestionTool),
     ]
 }
 
@@ -584,7 +604,7 @@ mod tests {
 
     #[test]
     fn test_file_read_permission_level() {
-        assert_eq!(FileReadTool.permission_level(), PermissionLevel::ReadOnly);
+        assert_eq!(FileReadTool::new().permission_level(), PermissionLevel::ReadOnly);
     }
 
     #[test]

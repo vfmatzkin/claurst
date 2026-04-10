@@ -220,6 +220,38 @@ pub struct SystemPromptOptions {
     pub coordinator_mode: bool,
     /// Skip auto-injecting platform/shell/date env info (set true only in tests).
     pub skip_env_info: bool,
+    /// Model name — used to select compact prompt for small local models.
+    pub model_name: Option<String>,
+}
+
+/// Returns true for models where a compact system prompt should be used
+/// (smaller context window, fewer active parameters).
+fn is_small_model(model: Option<&str>) -> bool {
+    let Some(m) = model else { return false };
+    let m = m.to_lowercase();
+    // Gemma edge models (E2B=2B, E4B=4B active params)
+    if m.contains("gemma4:e2b") || m.contains("gemma4:e4b") || m.contains("gemma-4-e") {
+        return true;
+    }
+    // Gemma 3 12B and under
+    if m.contains("gemma3") || m.contains("gemma-3") {
+        return true;
+    }
+    // Small Qwen/Phi/Llama models (rough heuristic: if tag contains a size ≤14)
+    for tag in ["qwen", "phi", "llama", "mistral", "nemo"] {
+        if m.contains(tag) {
+            // Check for size indicators like :7b, :8b, :14b, etc.
+            if let Some(pos) = m.find(':') {
+                let after = &m[pos+1..];
+                if let Some(num) = after.strip_suffix('b').and_then(|n| n.parse::<u32>().ok()) {
+                    if num <= 14 {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -250,25 +282,30 @@ pub fn build_system_prompt(opts: &SystemPromptOptions) -> String {
         });
 
     let mut parts: Vec<String> = Vec::new();
+    let compact = is_small_model(opts.model_name.as_deref());
 
     // ------------------------------------------------------------------ //
     // CACHEABLE sections (before the dynamic boundary)                   //
     // ------------------------------------------------------------------ //
 
     // 1. Attribution header
-    parts.push(prefix.attribution_text().to_string());
+    if compact {
+        parts.push("You are a coding assistant with file and shell tools.".to_string());
+    } else {
+        parts.push(prefix.attribution_text().to_string());
+    }
 
     // 2. Core capabilities
-    parts.push(CORE_CAPABILITIES.to_string());
+    parts.push(if compact { CORE_CAPABILITIES_COMPACT } else { CORE_CAPABILITIES }.to_string());
 
     // 3. Tool use guidelines
-    parts.push(TOOL_USE_GUIDELINES.to_string());
+    parts.push(if compact { TOOL_USE_GUIDELINES_COMPACT } else { TOOL_USE_GUIDELINES }.to_string());
 
     // 4. Executing actions with care
-    parts.push(ACTIONS_SECTION.to_string());
+    parts.push(if compact { ACTIONS_SECTION_COMPACT } else { ACTIONS_SECTION }.to_string());
 
     // 5. Safety guidelines
-    parts.push(SAFETY_GUIDELINES.to_string());
+    parts.push(if compact { SAFETY_GUIDELINES_COMPACT } else { SAFETY_GUIDELINES }.to_string());
 
     // 6. Cyber-risk instruction (owned by safeguards — do not edit)
     parts.push(CYBER_RISK_INSTRUCTION.to_string());
@@ -311,6 +348,18 @@ pub fn build_system_prompt(opts: &SystemPromptOptions) -> String {
     // 11. Working directory (legacy XML tag kept for caching compat)
     if let Some(cwd) = &opts.working_directory {
         parts.push(format!("\n<working_directory>{}</working_directory>", cwd));
+
+        // 11b. For small models: inject a directory tree so the model knows
+        // what files exist and doesn't guess or give up when looking for code.
+        if compact {
+            let tree = build_project_tree(cwd, 2, 80);
+            if !tree.is_empty() {
+                parts.push(format!(
+                    "\n<project_structure>\nDirectories and key files in the project:\n{}\n</project_structure>",
+                    tree
+                ));
+            }
+        }
     }
 
     // 12. Memory injection (from memdir)
@@ -327,6 +376,74 @@ pub fn build_system_prompt(opts: &SystemPromptOptions) -> String {
     }
 
     parts.join("\n")
+}
+
+/// Build a compact directory-only tree (respects .gitignore) up to `max_depth` levels.
+/// Shows directories + top-level files only. Used to orient small models in the project.
+fn build_project_tree(root: &str, max_depth: usize, max_lines: usize) -> String {
+    // Try `git ls-files` first — respects .gitignore, fast, and accurate.
+    let git_output = std::process::Command::new("git")
+        .args(["ls-files", "--cached", "--others", "--exclude-standard"])
+        .current_dir(root)
+        .output()
+        .ok();
+
+    let mut dirs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut top_files: Vec<String> = Vec::new();
+
+    if let Some(output) = git_output {
+        if output.status.success() {
+            let files = String::from_utf8_lossy(&output.stdout);
+            for line in files.lines() {
+                let parts: Vec<&str> = line.split('/').collect();
+                if parts.len() == 1 {
+                    // Top-level file — show it
+                    top_files.push(line.to_string());
+                } else {
+                    // Collect directories up to max_depth
+                    for depth in 1..=max_depth.min(parts.len() - 1) {
+                        dirs.insert(parts[..depth].join("/") + "/");
+                    }
+                }
+            }
+        }
+    } else {
+        // Fallback: simple directory listing
+        if let Ok(read_dir) = std::fs::read_dir(root) {
+            for entry in read_dir.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with('.') || name == "node_modules"
+                    || name == "__pycache__" || name == "target"
+                {
+                    continue;
+                }
+                if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    dirs.insert(format!("{}/", name));
+                } else {
+                    top_files.push(name);
+                }
+            }
+        }
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+
+    // Top-level files first (limited)
+    for f in top_files.iter().take(10) {
+        lines.push(f.clone());
+    }
+
+    // Then directories
+    for d in &dirs {
+        if lines.len() >= max_lines { break; }
+        lines.push(d.clone());
+    }
+
+    if lines.len() >= max_lines {
+        lines.push(format!("... ({} dirs total)", dirs.len()));
+    }
+
+    lines.join("\n")
 }
 
 /// Build the dynamic environment-info section injected after the boundary.
@@ -480,6 +597,20 @@ You have access to powerful tools for software engineering tasks:
 4. **Communicate blockers**: If stuck, ask the user rather than guessing
 "#;
 
+/// Compact capabilities for small local models — saves ~60% of prompt tokens.
+const CORE_CAPABILITIES_COMPACT: &str = r#"
+## Tools
+You have tools: Read, Edit, Write (files), Bash (commands), Grep, Glob (search).
+
+## Rules
+- ALWAYS search before giving up. If you can't find something, try Grep with different keywords or Glob with patterns like "**/*.py".
+- When asked about code: first Grep for relevant function/class names, then Read those specific lines.
+- For large files (>200 lines): use Grep to find relevant lines, then Read with offset/limit. NEVER read an entire large file.
+- A <project_structure> section is included below with the file tree. Use it to locate files before searching.
+- Make minimal, targeted changes. Don't refactor code you weren't asked to change.
+- If you truly cannot find something after 2-3 search attempts, ask the user for the file path.
+"#;
+
 const TOOL_USE_GUIDELINES: &str = r#"
 ## Tool use guidelines
 
@@ -488,6 +619,17 @@ const TOOL_USE_GUIDELINES: &str = r#"
 - Parallelize independent tool calls in a single response
 - For file edits: always read the file first, then make targeted edits
 - Bash commands timeout after 2 minutes; use background mode for long operations
+"#;
+
+/// Compact tool guidelines for small models.
+const TOOL_USE_GUIDELINES_COMPACT: &str = r#"
+## Tool tips
+- Use Grep (not bash grep) and Glob (not bash find).
+- Read a file before editing it.
+- Bash commands timeout after 2 minutes.
+- When Grep returns matches, READ the relevant code immediately — don't ask the user which file. Pick the most relevant match and read it.
+- Be autonomous: search → read → analyze → answer. Don't ask for clarification unless truly ambiguous.
+- When using Grep, set output_mode to "content" to see the matching lines with context.
 "#;
 
 const ACTIONS_SECTION: &str = r#"
@@ -500,6 +642,12 @@ the scope specified, not beyond. Match the scope of your actions to what was
 actually requested.
 "#;
 
+/// Compact actions section for small models.
+const ACTIONS_SECTION_COMPACT: &str = r#"
+## Caution
+Ask before destructive actions (delete, rm -rf, DROP TABLE, force push). Don't exceed the scope of what was requested.
+"#;
+
 const SAFETY_GUIDELINES: &str = r#"
 ## Safety guidelines
 
@@ -509,6 +657,9 @@ const SAFETY_GUIDELINES: &str = r#"
 - Don't commit secrets, credentials, or API keys
 - For ambiguous destructive actions, ask before proceeding
 "#;
+
+/// Compact safety for small models — merged into ACTIONS_SECTION_COMPACT.
+const SAFETY_GUIDELINES_COMPACT: &str = "";
 
 /// Security / cyber-risk instruction.
 /// No security guardrails injected.

@@ -16,16 +16,25 @@ use super::openai_compat::{OpenAiCompatProvider, ProviderQuirks};
 
 /// Ollama — local inference server.
 /// Reads `OLLAMA_HOST` for the base URL; defaults to `http://localhost:11434`.
+/// Reads `OLLAMA_NUM_CTX` to override context window size; defaults to 32768.
 pub fn ollama() -> OpenAiCompatProvider {
     let host = std::env::var("OLLAMA_HOST")
         .unwrap_or_else(|_| "http://localhost:11434".to_string());
     let base_url = format!("{}/v1", host.trim_end_matches('/'));
+    let num_ctx: u64 = std::env::var("OLLAMA_NUM_CTX")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(32_768);
     OpenAiCompatProvider::new(ProviderId::OLLAMA, "Ollama", base_url).with_quirks(
         ProviderQuirks {
             overflow_patterns: vec![
                 "prompt too long".to_string(),
                 "exceeded.*context length".to_string(),
             ],
+            // Ollama defaults to 4K context — override to usable size
+            extra_body: Some(serde_json::json!({
+                "options": { "num_ctx": num_ctx }
+            })),
             ..Default::default()
         },
     )

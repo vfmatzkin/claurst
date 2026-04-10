@@ -69,6 +69,10 @@ pub struct ProviderQuirks {
     /// Use this for providers whose models have a lower output ceiling than
     /// the default we request (e.g. DeepSeek Chat caps at 8 192).
     pub max_tokens_cap: Option<u32>,
+
+    /// Extra key-value pairs merged into the request body.  Useful for
+    /// provider-specific options like Ollama's `options.num_ctx`.
+    pub extra_body: Option<Value>,
 }
 
 // ---------------------------------------------------------------------------
@@ -297,6 +301,14 @@ impl OpenAiCompatProvider {
         if !request.stop_sequences.is_empty() {
             body["stop"] = json!(request.stop_sequences);
         }
+        // Merge provider-specific extra body fields (e.g. Ollama num_ctx)
+        if let Some(extra) = &self.quirks.extra_body {
+            if let Some(obj) = extra.as_object() {
+                for (k, v) in obj {
+                    body[k] = v.clone();
+                }
+            }
+        }
         merge_openai_compatible_options(&mut body, &request.provider_options);
 
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
@@ -378,6 +390,14 @@ impl OpenAiCompatProvider {
         }
         if !request.stop_sequences.is_empty() {
             body["stop"] = json!(request.stop_sequences);
+        }
+        // Merge provider-specific extra body fields (e.g. Ollama num_ctx)
+        if let Some(extra) = &self.quirks.extra_body {
+            if let Some(obj) = extra.as_object() {
+                for (k, v) in obj {
+                    body[k] = v.clone();
+                }
+            }
         }
         merge_openai_compatible_options(&mut body, &request.provider_options);
 

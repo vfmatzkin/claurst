@@ -853,7 +853,11 @@ fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
 
     let notice_lines = startup_notice_lines(app, content_area.width);
     let header_height = WELCOME_BOX_HEIGHT + notice_lines.len() as u16;
-    let show_logo_header = content_area.height >= header_height + 3 && content_area.width >= 60;
+    let has_messages = !app.messages.is_empty()
+        || !app.streaming_text.is_empty()
+        || !app.streaming_thinking.is_empty()
+        || !app.tool_use_blocks.is_empty();
+    let show_logo_header = !has_messages && content_area.height >= header_height + 3 && content_area.width >= 60;
     let (logo_area, notices_area, msg_area) = if show_logo_header {
         let splits = Layout::default()
             .direction(Direction::Vertical)
@@ -1396,30 +1400,28 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
 
     frame.render_widget(Paragraph::new(left_lines).wrap(Wrap { trim: false }), h_chunks[0]);
 
-    // --- Right column ---
-    let tip_text = claurst_core::tips::select_tip(0)
-        .map(|t| t.content.to_string())
-        .unwrap_or_else(|| "Edit AGENTS.md to add instructions for Claurst".to_string());
-
+    // --- Right column: keyboard shortcuts & commands ---
     let mut right_lines: Vec<Line> = Vec::new();
     right_lines.push(Line::from(Span::styled(
-        "Tips for getting started",
+        "Shortcuts",
         Style::default().fg(accent).add_modifier(Modifier::BOLD),
     )));
-    // Word-wrap the tip text into the right column width
-    let right_w_usize = right_w.saturating_sub(1) as usize;
-    for chunk in tip_text.chars().collect::<Vec<_>>().chunks(right_w_usize.max(1)) {
-        right_lines.push(Line::from(chunk.iter().collect::<String>()));
+    let shortcuts = [
+        ("Ctrl+A", "switch model"),
+        ("Ctrl+K", "command palette"),
+        ("Ctrl+C", "cancel / quit"),
+        ("Ctrl+L", "clear screen"),
+        ("/resume", "browse & resume sessions"),
+        ("/compact", "compress context"),
+        ("/clear", "clear conversation"),
+        ("Esc", "cancel input"),
+    ];
+    for (key, desc) in &shortcuts {
+        right_lines.push(Line::from(vec![
+            Span::styled(format!(" {:>10}", key), Style::default().fg(Color::Yellow)),
+            Span::styled(format!("  {}", desc), Style::default().fg(Color::Gray)),
+        ]));
     }
-    right_lines.push(Line::from(""));
-    right_lines.push(Line::from(Span::styled(
-        "Recent activity",
-        Style::default().fg(accent).add_modifier(Modifier::BOLD),
-    )));
-    right_lines.push(Line::from(Span::styled(
-        "No recent activity",
-        Style::default().fg(Color::DarkGray),
-    )));
 
     frame.render_widget(Paragraph::new(right_lines).wrap(Wrap { trim: false }), h_chunks[2]);
 }
